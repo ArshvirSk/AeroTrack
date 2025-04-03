@@ -1,0 +1,23 @@
+//
+Fix
+for
+Dashboard.jsx
+1.
+Change
+line
+167
+from:
+  return (
+to:
+  return (<>
+2.
+Change
+the
+last
+part
+of
+the
+file
+to:
+    </>
+  );
