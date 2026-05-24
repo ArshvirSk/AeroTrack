@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600" width="800" height="600">
+  <defs>
+    <linearGradient id="fade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#333333" stop-opacity="0.1"/>
+      <stop offset="100%" stop-color="#1a1a1a" stop-opacity="0.05"/>
+    </linearGradient>
+  </defs>
+  <path d="M400 300 L500 250 L750 200 L500 150 L400 100 L300 150 L50 200 L300 250 Z" fill="url(#fade)" transform="rotate(45, 400, 300)"/>
+</svg>

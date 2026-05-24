@@ -1,219 +1,167 @@
+require('dotenv').config();
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const helmet = require("helmet");
+const compression = require("compression");
+const rateLimit = require("express-rate-limit");
+const { body, validationResult } = require("express-validator");
+const fs = require("fs").promises;
+const path = require("path");
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Environment variables validation
+if (!process.env.AVIATIONSTACK_API_KEY || !process.env.OPENWEATHER_API_KEY) {
+  console.error("ERROR: Missing required API keys in environment variables");
+  console.error("Please check your .env file contains AVIATIONSTACK_API_KEY and OPENWEATHER_API_KEY");
+  process.exit(1);
+}
+
 // AviationStack API configuration
-const AVIATIONSTACK_API_KEY = "fc88ad2bfe585ba9c58f0021773faeef"; // Replace with your actual API key
-const AVIATIONSTACK_BASE_URL = "http://api.aviationstack.com/v1";
+const AVIATIONSTACK_API_KEY = process.env.AVIATIONSTACK_API_KEY;
+const AVIATIONSTACK_BASE_URL = "https://api.aviationstack.com/v1";
 
 // OpenWeatherMap API configuration
-const OPENWEATHER_API_KEY = "bb1ae91edbd801c0a95f4a93b14f7a71"; // Replace with your actual API key
+const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
 const OPENWEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5";
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-for-development-only';
 
-// Fallback data in case API limits are reached
-const flights = [
-  {
-    id: "FL001",
-    airline: "Air India",
-    origin: "Mumbai",
-    destination: "Delhi",
-    departureTime: "08:30",
-    arrivalTime: "10:45",
-    status: "On Time",
-    aircraft: "Boeing 737",
-    distance: 1148,
-  },
-  {
-    id: "FL002",
-    airline: "IndiGo",
-    origin: "Delhi",
-    destination: "Bangalore",
-    departureTime: "10:15",
-    arrivalTime: "13:00",
-    status: "Delayed",
-    aircraft: "Airbus A320",
-    distance: 1740,
-  },
-  {
-    id: "FL003",
-    airline: "SpiceJet",
-    origin: "Chennai",
-    destination: "Kolkata",
-    departureTime: "12:45",
-    arrivalTime: "15:20",
-    status: "On Time",
-    aircraft: "Boeing 737",
-    distance: 1366,
-  },
-  {
-    id: "FL004",
-    airline: "Vistara",
-    origin: "Bangalore",
-    destination: "Mumbai",
-    departureTime: "14:30",
-    arrivalTime: "16:15",
-    status: "On Time",
-    aircraft: "Airbus A320",
-    distance: 842,
-  },
-  {
-    id: "FL005",
-    airline: "Air India",
-    origin: "Kolkata",
-    destination: "Delhi",
-    departureTime: "16:00",
-    arrivalTime: "18:30",
-    status: "Delayed",
-    aircraft: "Boeing 787",
-    distance: 1305,
-  },
-];
+// API error messages
+const API_ERRORS = {
+  AUTH_FAILED: "Authentication failed. Please check your API key.",
+  RATE_LIMIT: "Rate limit exceeded. Please try again later.",
+  SERVER_ERROR: "Server error occurred. Please try again later.",
+};
 
+// Users database file path
+const USERS_DB_PATH = path.join(__dirname, 'users.json');
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: {
+    error: "Too many requests from this IP, please try again later."
+  }
+});
+
+// Auth rate limiting (more strict)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 auth attempts per windowMs
+  message: {
+    error: "Too many authentication attempts, please try again later."
+  }
+});
+
+// Security middleware
+app.use(helmet());
+app.use(compression());
+app.use(limiter);
+
+// CORS configuration
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true
+}));
+
+app.use(express.json({ limit: '10mb' }));
+
+// Request logging middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    console.log(
+      `[${new Date().toISOString()}] ${req.method} ${
+        req.originalUrl
+      } - Status: ${res.statusCode} - Duration: ${duration}ms`
+    );
+  });
+  next();
+});
+
+// Database helper functions
+async function readUsers() {
+  try {
+    const data = await fs.readFile(USERS_DB_PATH, 'utf8');
+    return JSON.parse(data);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      // File doesn't exist, return empty array
+      return [];
+    }
+    throw error;
+  }
+}
+
+async function writeUsers(users) {
+  await fs.writeFile(USERS_DB_PATH, JSON.stringify(users, null, 2));
+}
+
+// JWT middleware for authentication
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ 
+      error: 'Access token required',
+      code: 'MISSING_TOKEN'
+    });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ 
+        error: 'Invalid or expired token',
+        code: 'INVALID_TOKEN'
+      });
+    }
+    req.user = user;
+    next();
+  });
+}
+
+// Validation middleware
+function handleValidationErrors(req, res, next) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({
+      error: 'Validation failed',
+      details: errors.array()
+    });
+  }
+  next();
+}
+
+// Airport data with coordinates
 const airportsWithCoordinates = [
-  {
-    code: "BOM",
-    name: "Chhatrapati Shivaji Maharaj International Airport",
-    city: "Mumbai",
-    country: "India",
-    terminals: 2,
-    runways: 2,
-    lat: 19.0896,
-    lng: 72.8656,
-  },
-  {
-    code: "DEL",
-    name: "Indira Gandhi International Airport",
-    city: "Delhi",
-    country: "India",
-    terminals: 3,
-    runways: 3,
-    lat: 28.5561,
-    lng: 77.1,
-  },
-  {
-    code: "BLR",
-    name: "Kempegowda International Airport",
-    city: "Bangalore",
-    country: "India",
-    terminals: 2,
-    runways: 2,
-    lat: 13.1986,
-    lng: 77.7066,
-  },
-  {
-    code: "MAA",
-    name: "Chennai International Airport",
-    city: "Chennai",
-    country: "India",
-    terminals: 2,
-    runways: 2,
-    lat: 12.9941,
-    lng: 80.1709,
-  },
-  {
-    code: "CCU",
-    name: "Netaji Subhas Chandra Bose International Airport",
-    city: "Kolkata",
-    country: "India",
-    terminals: 2,
-    runways: 2,
-    lat: 22.652,
-    lng: 88.4463,
-  },
-  {
-    code: "JFK",
-    name: "John F. Kennedy International Airport",
-    city: "New York",
-    country: "United States",
-    terminals: 6,
-    runways: 4,
-    lat: 40.6413,
-    lng: -73.7781,
-  },
-  {
-    code: "LHR",
-    name: "Heathrow Airport",
-    city: "London",
-    country: "United Kingdom",
-    terminals: 4,
-    runways: 2,
-    lat: 51.47,
-    lng: -0.4543,
-  },
-  {
-    code: "DXB",
-    name: "Dubai International Airport",
-    city: "Dubai",
-    country: "United Arab Emirates",
-    terminals: 3,
-    runways: 2,
-    lat: 25.2532,
-    lng: 55.3657,
-  },
-  {
-    code: "SIN",
-    name: "Singapore Changi Airport",
-    city: "Singapore",
-    country: "Singapore",
-    terminals: 4,
-    runways: 2,
-    lat: 1.3644,
-    lng: 103.9915,
-  },
-  {
-    code: "HND",
-    name: "Tokyo Haneda Airport",
-    city: "Tokyo",
-    country: "Japan",
-    terminals: 3,
-    runways: 4,
-    lat: 35.5494,
-    lng: 139.7798,
-  },
+  { city: "Mumbai", code: "BOM", lat: 19.0896, lng: 72.8656 },
+  { city: "Delhi", code: "DEL", lat: 28.5561, lng: 77.1 },
+  { city: "Bangalore", code: "BLR", lat: 13.1986, lng: 77.7066 },
+  { city: "Chennai", code: "MAA", lat: 12.9941, lng: 80.1709 },
+  { city: "Kolkata", code: "CCU", lat: 22.6453, lng: 88.4467 },
+  { city: "Hyderabad", code: "HYD", lat: 17.2403, lng: 78.4294 },
+  { city: "Ahmedabad", code: "AMD", lat: 23.0225, lng: 72.5714 },
+  { city: "Pune", code: "PNQ", lat: 18.5793, lng: 73.9089 },
+  { city: "Goa", code: "GOI", lat: 15.3808, lng: 73.8314 },
+  { city: "Kochi", code: "COK", lat: 10.1517, lng: 76.3919 },
 ];
 
+// Sample airlines for mock data
 const airlines = [
-  {
-    code: "AI",
-    name: "Air India",
-    country: "India",
-    fleet: 127,
-    destinations: 102,
-  },
-  {
-    code: "6E",
-    name: "IndiGo",
-    country: "India",
-    fleet: 275,
-    destinations: 95,
-  },
-  {
-    code: "SG",
-    name: "SpiceJet",
-    country: "India",
-    fleet: 76,
-    destinations: 52,
-  },
-  {
-    code: "UK",
-    name: "Vistara",
-    country: "India",
-    fleet: 51,
-    destinations: 43,
-  },
-  {
-    code: "G8",
-    name: "GoAir",
-    country: "India",
-    fleet: 57,
-    destinations: 38,
-  },
+  { name: "Air India", code: "AI" },
+  { name: "IndiGo", code: "6E" },
+  { name: "SpiceJet", code: "SG" },
+  { name: "Vistara", code: "UK" },
+  { name: "GoAir", code: "G8" },
 ];
 
 const weatherData = {
@@ -247,94 +195,282 @@ const mapWeatherCondition = (weatherId) => {
   return "clear"; // Default
 };
 
-// API endpoint to get real-time flight positions for the map
-app.get("/api/live-flights", async (req, res) => {
+// =================== AUTHENTICATION ENDPOINTS ===================
+
+// Register endpoint
+app.post("/api/auth/register", [
+  authLimiter,
+  body('email').isEmail().normalizeEmail(),
+  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters long'),
+  body('name').trim().isLength({ min: 1 }).withMessage('Name is required'),
+  handleValidationErrors
+], async (req, res) => {
   try {
-    // Use AviationStack API instead of OpenSky
-    const response = await axios.get(`${AVIATIONSTACK_BASE_URL}/flights`, {
-      params: {
-        access_key: AVIATIONSTACK_API_KEY,
-        flight_status: "active", // Get only active flights
-        limit: 100, // Increased limit to get more flights
-      },
+    const { email, password, name } = req.body;
+    
+    // Read existing users
+    const users = await readUsers();
+    
+    // Check if user already exists
+    if (users.find(user => user.email === email)) {
+      return res.status(409).json({
+        error: 'Email already registered',
+        code: 'EMAIL_EXISTS'
+      });
+    }
+    
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 12);
+    
+    // Create new user
+    const newUser = {
+      id: Date.now().toString(),
+      email,
+      name,
+      password: hashedPassword,
+      createdAt: new Date().toISOString()
+    };
+    
+    users.push(newUser);
+    await writeUsers(users);
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: newUser.id, email: newUser.email },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+    
+    res.status(201).json({
+      message: 'User registered successfully',
+      token,
+      user: {
+        id: newUser.id,
+        email: newUser.email,
+        name: newUser.name
+      }
+    });
+    
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({
+      error: 'Internal server error during registration',
+      code: 'REGISTRATION_ERROR'
+    });
+  }
+});
+
+// Login endpoint
+app.post("/api/auth/login", [
+  authLimiter,
+  body('email').isEmail().normalizeEmail(),
+  body('password').notEmpty().withMessage('Password is required'),
+  handleValidationErrors
+], async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    // Read users
+    const users = await readUsers();
+    
+    // Find user
+    const user = users.find(u => u.email === email);
+    if (!user) {
+      return res.status(401).json({
+        error: 'Invalid email or password',
+        code: 'INVALID_CREDENTIALS'
+      });
+    }
+    
+    // Verify password
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        error: 'Invalid email or password',
+        code: 'INVALID_CREDENTIALS'
+      });
+    }
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+    
+    res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name
+      }
+    });
+    
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      error: 'Internal server error during login',
+      code: 'LOGIN_ERROR'
+    });
+  }
+});
+
+// Get current user profile (protected route)
+app.get("/api/auth/profile", authenticateToken, async (req, res) => {
+  try {
+    const users = await readUsers();
+    const user = users.find(u => u.id === req.user.userId);
+    
+    if (!user) {
+      return res.status(404).json({
+        error: 'User not found',
+        code: 'USER_NOT_FOUND'
+      });
+    }
+    
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        createdAt: user.createdAt
+      }
+    });
+    
+  } catch (error) {
+    console.error('Profile fetch error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      code: 'PROFILE_ERROR'
+    });
+  }
+});
+
+// Token verification endpoint
+app.post("/api/auth/verify", authenticateToken, (req, res) => {
+  res.json({
+    valid: true,
+    user: {
+      userId: req.user.userId,
+      email: req.user.email
+    }
+  });
+});
+
+// =================== FLIGHT DATA ENDPOINTS ===================
+
+// API endpoint to get real-time flight positions for the map
+app.get("/api/live-flights", authenticateToken, async (req, res) => {
+  try {
+    // Make request to AviationStack API with retry mechanism
+    const maxRetries = 3;
+    let retryCount = 0;
+    let response;
+
+    while (retryCount < maxRetries) {
+      try {
+        response = await axios.get(`${AVIATIONSTACK_BASE_URL}/flights`, {
+          params: {
+            access_key: AVIATIONSTACK_API_KEY,
+            flight_status: "active",
+            limit: 100,
+          },
+          timeout: 10000, // 10 second timeout
+        });
+        break; // If successful, break the retry loop
+      } catch (retryError) {
+        retryCount++;
+        if (retryCount === maxRetries) {
+          throw retryError; // If all retries failed, throw the error
+        }
+        // Wait before retrying (exponential backoff)
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.pow(2, retryCount) * 1000)
+        );
+      }
+    }
+
+    // Validate API response
+    if (!response?.data?.data || !Array.isArray(response.data.data)) {
+      throw new Error("Invalid API response format");
+    }
+
+    // Filter and process flights
+    const activeFlights = response.data.data.filter((flight) => {
+      return (
+        flight?.live?.latitude &&
+        flight?.live?.longitude &&
+        flight?.flight?.iata &&
+        flight?.airline?.name
+      );
     });
 
-    if (response.data && response.data.data && response.data.data.length > 0) {
-      // Get a random subset of flights to display (limit to 30 for performance)
-      const randomFlights = response.data.data
-        .filter(
-          (flight) =>
-            flight.live && flight.live.latitude && flight.live.longitude
-        ) // Filter flights with position data
-        .sort(() => 0.5 - Math.random()) // Shuffle array
-        .slice(0, 30); // Take first 30
-
-      const formattedFlights = randomFlights.map((flight) => {
-        const callsign = flight.flight.iata || flight.flight.icao || "UNKNOWN";
-
-        // Map AviationStack flight status to our application's expected status values
-        let flightStatus = "Cruising"; // Default status
-        if (flight.flight_status === "landed") {
-          flightStatus = "On Ground";
-        } else if (flight.flight_status === "active") {
-          // For active flights, determine status based on altitude or other factors if available
-          if (flight.live && flight.live.is_ground) {
-            flightStatus = "On Ground";
-          } else if (flight.live && flight.live.altitude) {
-            // Randomly assign climbing/descending/cruising for more interesting data visualization
-            // In a real app, you would use vertical rate data which AviationStack doesn't provide
-            const statusOptions = ["Cruising", "Climbing", "Descending"];
-            flightStatus =
-              statusOptions[Math.floor(Math.random() * statusOptions.length)];
-          }
-        }
-
-        return {
-          id:
-            flight.flight.iata ||
-            flight.flight.icao ||
-            `FL${Math.floor(Math.random() * 1000)}`,
-          callsign: callsign,
-          airline: flight.airline.name || getAirlineFromCallsign(callsign),
-          flightNumber:
-            flight.flight.number || getFlightNumberFromCallsign(callsign),
-          origin: flight.departure.airport || "Unknown Origin",
-          originCode: flight.departure.iata || "???",
-          originCoordinates: {
-            lat: flight.departure.latitude || 0,
-            lng: flight.departure.longitude || 0,
-          },
-          destination: flight.arrival.airport || "Unknown Destination",
-          destinationCode: flight.arrival.iata || "???",
-          destinationCoordinates: {
-            lat: flight.arrival.latitude || 0,
-            lng: flight.arrival.longitude || 0,
-          },
-          latitude: flight.live.latitude || 0,
-          longitude: flight.live.longitude || 0,
-          altitude:
-            flight.live.altitude || Math.floor(Math.random() * 35000) + 5000,
-          speed: flight.live.speed || Math.floor(Math.random() * 400) + 300,
-          heading: flight.live.direction || Math.floor(Math.random() * 360),
-          verticalRate: 0, // AviationStack doesn't provide vertical rate
-          status: flightStatus,
-        };
-      });
-
-      res.json(formattedFlights);
-    } else {
-      // If no flights with position data, fallback to mock data
-      console.log(
-        "No flights with position data from AviationStack, using fallback data"
-      );
-      res.json(generateMockFlightData());
+    if (activeFlights.length === 0) {
+      console.log("No active flights found, using fallback data");
+      return res.json(generateMockFlightData());
     }
+
+    // Process and format flight data
+    const formattedFlights = activeFlights.slice(0, 40).map((flight) => {
+      const callsign = flight.flight.iata || flight.flight.icao || "UNKNOWN";
+
+      // Determine flight status based on available data
+      let flightStatus = "Cruising";
+      if (
+        flight.flight_status === "landed" ||
+        (flight.live && flight.live.is_ground)
+      ) {
+        flightStatus = "On Ground";
+      } else if (flight.live && flight.live.altitude) {
+        const altitude = parseFloat(flight.live.altitude);
+        if (altitude < 5000) flightStatus = "Descending";
+        else if (altitude > 30000) flightStatus = "Climbing";
+      }
+
+      // Calculate estimated price based on distance and flight duration
+      const basePrice = 2000;
+      const distanceFactor = flight.flight.distance
+        ? Math.floor(flight.flight.distance / 100)
+        : 0;
+      const price =
+        basePrice + distanceFactor * 50 + Math.floor(Math.random() * 1000);
+
+      return {
+        id: flight.flight.iata || flight.flight.icao,
+        callsign,
+        airline: flight.airline.name,
+        flightNumber: flight.flight.number || flight.flight.iata,
+        origin: flight.departure.airport,
+        originCode: flight.departure.iata,
+        originCoordinates: {
+          lat: parseFloat(flight.departure.latitude) || 0,
+          lng: parseFloat(flight.departure.longitude) || 0,
+        },
+        destination: flight.arrival.airport,
+        destinationCode: flight.arrival.iata,
+        destinationCoordinates: {
+          lat: parseFloat(flight.arrival.latitude) || 0,
+          lng: parseFloat(flight.arrival.longitude) || 0,
+        },
+        latitude: parseFloat(flight.live.latitude),
+        longitude: parseFloat(flight.live.longitude),
+        altitude: parseFloat(flight.live.altitude) || 35000,
+        speed: parseFloat(flight.live.speed) || 400,
+        heading: parseFloat(flight.live.direction) || 0,
+        verticalRate: 0,
+        status: flightStatus,
+        price,
+      };
+    });
+
+    res.json(formattedFlights);
   } catch (error) {
-    console.error(
-      "Error fetching flights from AviationStack API:",
-      error.message
-    );
-    // Fallback to sample data if API call fails
+    console.error("AviationStack API Error:", error.message);
+    if (error.response) {
+      console.error("API Response:", error.response.data);
+    }
     res.json(generateMockFlightData());
   }
 });
@@ -590,13 +726,14 @@ function generateMockFlightData() {
 }
 
 // Routes
-app.get("/api/flights", async (req, res) => {
+app.get("/api/flights", authenticateToken, async (req, res) => {
   try {
     const response = await axios.get(`${AVIATIONSTACK_BASE_URL}/flights`, {
       params: {
         access_key: AVIATIONSTACK_API_KEY,
-        limit: 30, // Limit to 10 flights to conserve API calls
+        limit: 30, // Limit to 30 flights to conserve API calls
       },
+      timeout: 10000, // 10 second timeout
     });
 
     if (response.data && response.data.data) {
@@ -619,9 +756,8 @@ app.get("/api/flights", async (req, res) => {
           : "N/A",
         status: flight.flight_status || "Unknown",
         aircraft: flight.aircraft?.icao || "Unknown Aircraft",
-        distance: Math.floor(Math.random() * 3000) + 500, // API doesn't provide distance, so we generate a random one
+        distance: Math.floor(Math.random() * 3000) + 500, // API doesn't provide distance
       }));
-
       res.json(formattedFlights);
     } else {
       // Fallback to sample data if API response is invalid
@@ -630,12 +766,25 @@ app.get("/api/flights", async (req, res) => {
     }
   } catch (error) {
     console.error("Error fetching flights from API:", error.message);
+
+    // Handle specific API errors
+    if (error.response) {
+      const { status } = error.response;
+      if (status === 401 || status === 403) {
+        console.error(API_ERRORS.AUTH_FAILED);
+      } else if (status === 429) {
+        console.error(API_ERRORS.RATE_LIMIT);
+      } else if (status >= 500) {
+        console.error(API_ERRORS.SERVER_ERROR);
+      }
+    }
+
     // Fallback to sample data if API call fails
-    res.json(flights);
+    res.json(generateMockFlightData());
   }
 });
 
-app.get("/api/flights/:id", async (req, res) => {
+app.get("/api/flights/:id", authenticateToken, async (req, res) => {
   try {
     const response = await axios.get(`${AVIATIONSTACK_BASE_URL}/flights`, {
       params: {
@@ -691,41 +840,29 @@ app.get("/api/flights/:id", async (req, res) => {
   }
 });
 
-app.get("/api/airports", async (req, res) => {
+app.get("/api/airports", authenticateToken, async (req, res) => {
   try {
-    // AviationStack doesn't have a dedicated airports endpoint in the free tier
-    // We can use the autocomplete endpoint with a broad search term
-    const response = await axios.get(`${AVIATIONSTACK_BASE_URL}/airports`, {
-      params: {
-        access_key: AVIATIONSTACK_API_KEY,
-        limit: 10, // Limit to 10 airports to conserve API calls
+    // Use the predefined airportsWithCoordinates array instead of making an API call
+    const formattedAirports = airportsWithCoordinates.map((airport) => ({
+      code: airport.code,
+      city: airport.city,
+      country: "India",
+      terminals: Math.floor(Math.random() * 3) + 1,
+      runways: Math.floor(Math.random() * 3) + 1,
+      coordinates: {
+        lat: airport.lat,
+        lng: airport.lng,
       },
-    });
+    }));
 
-    if (response.data && response.data.data && response.data.data.length > 0) {
-      const formattedAirports = response.data.data.map((airport) => ({
-        code: airport.iata_code || "???",
-        name: airport.airport_name || "Unknown Airport",
-        city: airport.city_name || "Unknown City",
-        country: airport.country_name || "Unknown Country",
-        terminals: Math.floor(Math.random() * 3) + 1, // API doesn't provide terminal count
-        runways: Math.floor(Math.random() * 3) + 1, // API doesn't provide runway count
-      }));
-
-      res.json(formattedAirports);
-    } else {
-      // Fallback to sample data if API response is invalid
-      console.log("Invalid API response, using fallback data");
-      res.json(airportsWithCoordinates);
-    }
+    res.json(formattedAirports);
   } catch (error) {
-    console.error("Error fetching airports from API:", error.message);
-    // Fallback to sample data if API call fails
-    res.json(airportsWithCoordinates);
+    console.error("Error serving airports data:", error.message);
+    res.status(500).json({ error: "Failed to fetch airports" });
   }
 });
 
-app.get("/api/airports/:code", async (req, res) => {
+app.get("/api/airports/:code", authenticateToken, async (req, res) => {
   try {
     const response = await axios.get(`${AVIATIONSTACK_BASE_URL}/airports`, {
       params: {
@@ -747,32 +884,20 @@ app.get("/api/airports/:code", async (req, res) => {
 
       res.json(formattedAirport);
     } else {
-      // Fallback to sample data if airport not found in API
-      const airport = airportsWithCoordinates.find(
-        (a) => a.code === req.params.code.toUpperCase()
-      );
-      if (!airport) {
-        return res.status(404).json({ message: "Airport not found" });
-      }
-      res.json(airport);
+      // Return 404 if airport not found in API
+      return res.status(404).json({ message: "Airport not found" });
     }
   } catch (error) {
     console.error(
       `Error fetching airport ${req.params.code} from API:`,
       error.message
     );
-    // Fallback to sample data if API call fails
-    const airport = airportsWithCoordinates.find(
-      (a) => a.code === req.params.code.toUpperCase()
-    );
-    if (!airport) {
-      return res.status(404).json({ message: "Airport not found" });
-    }
-    res.json(airport);
+    // Return error if API call fails
+    res.status(500).json({ error: "Failed to fetch airport from API" });
   }
 });
 
-app.get("/api/airlines", async (req, res) => {
+app.get("/api/airlines", authenticateToken, async (req, res) => {
   try {
     const response = await axios.get(`${AVIATIONSTACK_BASE_URL}/airlines`, {
       params: {
@@ -792,18 +917,17 @@ app.get("/api/airlines", async (req, res) => {
 
       res.json(formattedAirlines);
     } else {
-      // Fallback to sample data if API response is invalid
-      console.log("Invalid API response, using fallback data");
-      res.json(airlines);
+      // Return error if API response is invalid
+      res.status(500).json({ error: "Invalid API response" });
     }
   } catch (error) {
     console.error("Error fetching airlines from API:", error.message);
-    // Fallback to sample data if API call fails
-    res.json(airlines);
+    // Return error if API call fails
+    res.status(500).json({ error: "Failed to fetch airlines from API" });
   }
 });
 
-app.get("/api/airlines/:code", async (req, res) => {
+app.get("/api/airlines/:code", authenticateToken, async (req, res) => {
   try {
     const response = await axios.get(`${AVIATIONSTACK_BASE_URL}/airlines`, {
       params: {
@@ -824,34 +948,34 @@ app.get("/api/airlines/:code", async (req, res) => {
 
       res.json(formattedAirline);
     } else {
-      // Fallback to sample data if airline not found in API
-      const airline = airlines.find(
-        (a) => a.code === req.params.code.toUpperCase()
-      );
-      if (!airline) {
-        return res.status(404).json({ message: "Airline not found" });
-      }
-      res.json(airline);
+      // Return 404 if airline not found in API
+      return res.status(404).json({ message: "Airline not found" });
     }
   } catch (error) {
     console.error(
       `Error fetching airline ${req.params.code} from API:`,
       error.message
     );
-    // Fallback to sample data if API call fails
-    const airline = airlines.find(
-      (a) => a.code === req.params.code.toUpperCase()
-    );
-    if (!airline) {
-      return res.status(404).json({ message: "Airline not found" });
-    }
-    res.json(airline);
+    // Return error if API call fails
+    res.status(500).json({ error: "Failed to fetch airline from API" });
   }
 });
 
-app.get("/api/weather/:city", async (req, res) => {
+app.get("/api/weather/:city", [
+  authenticateToken,
+  body('city').optional().trim().isLength({ max: 100 }).matches(/^[a-zA-Z\s]+$/).withMessage('Invalid city name'),
+  handleValidationErrors
+], async (req, res) => {
   try {
     const city = req.params.city;
+    
+    // Additional validation for city parameter
+    if (!city || city.length > 100 || !/^[a-zA-Z\s]+$/.test(city)) {
+      return res.status(400).json({
+        error: 'Invalid city name. Only letters and spaces allowed, maximum 100 characters.',
+        code: 'INVALID_CITY_NAME'
+      });
+    }
     const response = await axios.get(`${OPENWEATHER_BASE_URL}/weather`, {
       params: {
         q: city,
