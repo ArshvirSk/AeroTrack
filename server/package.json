@@ -1,7 +1,9 @@
 {
-  "name": "aviation-website-server",
+  "name": "aerotrack-server",
   "version": "1.0.0",
-  "description": "Backend server for the aviation website",
+  "description": "Backend server for AeroTrack: Real-time global flight tracking and weather intelligence dashboard.",
+  "author": "Full-Stack Developer",
+  "license": "MIT",
   "main": "index.js",
   "scripts": {
     "start": "nodemon index.js",
