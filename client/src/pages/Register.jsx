@@ -6,6 +6,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { AlertCircle, Lock, Mail, Plane, User } from "lucide-react";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import logo from "../assets/logo.png";
 
 const Register = () => {
   const navigate = useNavigate();
@@ -46,8 +47,8 @@ const Register = () => {
         <div className="text-center mb-8">
           <div className="flex justify-center mb-4">
             <div className="relative">
-              <div className="w-16 h-16 bg-yellow-500/20 rounded-full flex items-center justify-center">
-                <Plane className="w-8 h-8 text-yellow-500" />
+              <div className="w-16 h-16 bg-yellow-500/20 rounded-full flex items-center justify-center overflow-hidden p-2">
+                <img src={logo} alt="Logo" className="w-full h-full object-contain" />
               </div>
             </div>
           </div>
